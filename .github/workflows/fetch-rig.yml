@@ -1,0 +1,62 @@
+name: fetch-rig
+on:
+  workflow_dispatch:
+    inputs:
+      batch_ref:
+        description: 'unique batch marker (also names the artifacts)'
+        default: 'current'
+      batch_file:
+        description: 'batch file to read (per-run, enables concurrency)'
+        default: 'batch/current.tsv'
+jobs:
+  fetch:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fetch shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          BATCH_FILE: ${{ github.event.inputs.batch_file }}
+        run: |
+          python3 - <<'PY'
+          import os, json, time, urllib.request, hashlib, pathlib
+          from concurrent.futures import ThreadPoolExecutor
+          shard=int(os.environ["SHARD"])
+          ip=urllib.request.urlopen("https://api.ipify.org",timeout=15).read().decode()
+          bf=pathlib.Path(os.environ.get("BATCH_FILE") or "batch/current.tsv")
+          if not bf.exists(): print("no batch file"); raise SystemExit(0)
+          rows=[]
+          for line in bf.read_text().splitlines():
+              if not line.strip(): continue
+              o,d,k=line.split("\t")
+              if int(k[-2:])%40==shard: rows.append((o,d,k))
+          print(f"shard {shard} ip={ip} rows={len(rows)} GATELESS CONC=16")
+          outdir=pathlib.Path(f"out/shard_{shard}"); outdir.mkdir(parents=True,exist_ok=True)
+          BASE="https://w2.brreg.no/kunngjoring/hent_en.jsp"
+          def fetch(row):
+              o,d,k=row; url=f"{BASE}?kid={k}&sokeverdi={o}&spraak=nb"; t0=time.time()
+              try: body=urllib.request.urlopen(url,timeout=25).read()
+              except Exception as e: return {"kid":k,"verdict":"error","err":str(e)[:50],"ip":ip}
+              dt=round(time.time()-t0,3); size=len(body)
+              is_err=b"Det har oppst" in body or b"igjen senere" in body
+              # GATELESS: write EVERY body raw, no size/shell/err discard. classify at query time.
+              (outdir/f"{o}-{d}-{k}.html").write_bytes(body)
+              verdict="ok" if (size>26200 and not is_err and k.encode() in body) else "short"
+              return {"kid":k,"verdict":verdict,"size":size,"is_err":is_err,"sha256":hashlib.sha256(body).hexdigest(),"ip":ip,"dt":dt}
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              man=list(ex.map(fetch, rows))
+          ok=sum(1 for m in man if m['verdict']=='ok'); short=sum(1 for m in man if m['verdict']=='short'); err=sum(1 for m in man if m['verdict']=='error')
+          (outdir/"_manifest.jsonl").write_text("\n".join(json.dumps(m) for m in man))
+          (outdir/"_meta.json").write_text(json.dumps({"shard":shard,"runner_ip":ip,"processed":len(rows),"ok":ok,"short":short,"err":err}))
+          print(f"shard {shard} DONE ip={ip} ok={ok} short={short} err={err} (all written)")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: ${{ hashFiles(format('out/shard_{0}/**', matrix.shard)) != '' }}
+        with:
+          name: fetch-${{ github.event.inputs.batch_ref }}-shard-${{ matrix.shard }}
+          path: out/shard_${{ matrix.shard }}
+          retention-days: 90
